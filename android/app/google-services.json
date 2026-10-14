@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "110828752834",
+    "project_id": "test-multitenant-6397f",
+    "storage_bucket": "test-multitenant-6397f.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:110828752834:android:659104094e40789e2a105b",
+        "android_client_info": {
+          "package_name": "com.example.flutter_multi_tenant"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyA8o2Hp3oDH3r4qr065DishZy-FSj4PuLE"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

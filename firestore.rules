@@ -1,0 +1,352 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    //
+    // /users/{userId}
+    //   - uid: string (matches userId)
+    //   - email: string
+    //   - displayName: string
+    //   - organizationIds: list (organization IDs user belongs to)
+    //   - defaultOrganizationId: string (optional)
+    //   - createdAt: timestamp
+    //
+    // /organizations/{orgId}
+    //   - id: string (matches orgId)
+    //   - name: string (1-100 chars)
+    //   - ownerId: string
+    //   - createdAt: timestamp
+    //   - updatedAt: timestamp
+    //   - settings: map
+    //
+    // /organizations/{orgId}/members/{userId}
+    //   - userId: string (matches userId)
+    //   - email: string
+    //   - displayName: string
+    //   - role: string ("Owner" | "Admin" | "Manager" | "Member" | "Viewer")
+    //   - joinedAt: timestamp
+    //   - invitedBy: string
+    //
+    // /organizations/{orgId}/tasks/{taskId}
+    //   - id: string
+    //   - orgId: string (matches orgId)
+    //   - title: string (1-200 chars)
+    //   - description: string
+    //   - status: string ("To Do" | "In Progress" | "Done")
+    //   - priority: string ("Low" | "Medium" | "High" | "Urgent")
+    //   - assigneeId: string (or null)
+    //   - assigneeName: string (or null)
+    //   - creatorId: string (matches request.auth.uid)
+    //   - creatorName: string
+    //   - dueDate: timestamp (or null)
+    //   - createdAt: timestamp
+    //   - updatedAt: timestamp
+    //
+    // /organizations/{orgId}/audit_logs/{logId}
+    //   - id: string
+    //   - actorId: string (matches request.auth.uid)
+    //   - actorEmail: string
+    //   - organizationId: string (matches orgId)
+    //   - action: string
+    //   - targetId: string
+    //   - targetType: string
+    //   - timestamp: timestamp
+    //   - details: map
+    // ===============================================================
+
+    // 1. GLOBAL DEFAULT DENY
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isUser(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isOrgMember(orgId) {
+      return isAuthenticated() &&
+        exists(/databases/$(database)/documents/organizations/$(orgId)/members/$(request.auth.uid));
+    }
+
+    function getMemberData(orgId) {
+      return get(/databases/$(database)/documents/organizations/$(orgId)/members/$(request.auth.uid)).data;
+    }
+
+    function getRole(orgId) {
+      return getMemberData(orgId).role;
+    }
+
+    function isOwner(orgId) {
+      return isOrgMember(orgId) && getRole(orgId) == 'Owner';
+    }
+
+    function isAdmin(orgId) {
+      return isOrgMember(orgId) && getRole(orgId) == 'Admin';
+    }
+
+    function isManager(orgId) {
+      return isOrgMember(orgId) && getRole(orgId) == 'Manager';
+    }
+
+    function isMemberRole(orgId) {
+      return isOrgMember(orgId) && getRole(orgId) == 'Member';
+    }
+
+    function isViewer(orgId) {
+      return isOrgMember(orgId) && getRole(orgId) == 'Viewer';
+    }
+
+    function isManagerOrAbove(orgId) {
+      return isOrgMember(orgId) && (getRole(orgId) == 'Owner' || getRole(orgId) == 'Admin' || getRole(orgId) == 'Manager');
+    }
+
+    function isAdminOrOwner(orgId) {
+      return isOrgMember(orgId) && (getRole(orgId) == 'Owner' || getRole(orgId) == 'Admin');
+    }
+
+    function isValidRole(role) {
+      return role in ['Owner', 'Admin', 'Manager', 'Member', 'Viewer'];
+    }
+
+    function isValidStatus(status) {
+      return status in ['To Do', 'In Progress', 'Done'];
+    }
+
+    function isValidPriority(priority) {
+      return priority in ['Low', 'Medium', 'High', 'Urgent'];
+    }
+
+    // ===============================================================
+    // User Profiles Collection
+    // ===============================================================
+    match /users/{userId} {
+      // User can read and manage their own profile
+      allow read: if isUser(userId);
+      allow create: if isUser(userId) && request.resource.data.uid == userId;
+      allow update: if isUser(userId) && request.resource.data.uid == userId;
+      allow delete: if false;
+    }
+
+    // ===============================================================
+    // Organizations Collection
+    // ===============================================================
+    match /organizations/{orgId} {
+      // Only active members of this tenant can read organization details
+      allow read: if isOrgMember(orgId);
+
+      // Any authenticated user can create an organization if they make themselves the owner
+      allow create: if isAuthenticated() &&
+        request.resource.data.ownerId == request.auth.uid &&
+        request.resource.data.id == orgId;
+
+      // Settings management restricted strictly to Owner and Admin
+      allow update: if isAdminOrOwner(orgId) &&
+        request.resource.data.id == orgId &&
+        // Non-owners cannot change the ownerId field
+        (isOwner(orgId) || request.resource.data.ownerId == resource.data.ownerId);
+
+      // Only Owner can delete an organization
+      allow delete: if isOwner(orgId);
+
+      // =============================================================
+      // Subcollection: Members
+      // =============================================================
+      match /members/{memberUserId} {
+        // All tenant members can see the member roster
+        allow read: if isOrgMember(orgId);
+
+        // Member addition/creation:
+        // 1. Initial owner bootstrap when creating org
+        // 2. Owner can invite any role
+        // 3. Admin can invite Manager, Member, or Viewer (CANNOT invite/create Owner)
+        // 4. Invited user accepting an invitation (cannot assign self Owner)
+        allow create: if isAuthenticated() && (
+          // Initial bootstrap: creator adding themselves as Owner
+          (memberUserId == request.auth.uid && request.resource.data.role == 'Owner') ||
+          // Owner invites someone
+          (isOwner(orgId) && isValidRole(request.resource.data.role)) ||
+          // Admin invites someone (hierarchy limit: cannot assign Owner)
+          (isAdmin(orgId) && isValidRole(request.resource.data.role) && request.resource.data.role != 'Owner') ||
+          // Invited user claiming their membership with their authenticated email
+          (
+            memberUserId == request.auth.uid &&
+            request.resource.data.email == request.auth.token.email &&
+            isValidRole(request.resource.data.role) &&
+            request.resource.data.role != 'Owner'
+          )
+        );
+
+        // Member role updates:
+        // - Self-update allowed for profile info (e.g. displayName) if role remains identical
+        // - Owner can modify any role
+        // - Admin cannot modify Owner role, nor promote anyone to Owner
+        // - Owner retention: Cannot demote the primary owner if it leaves 0 owners
+        allow update: if isAuthenticated() && (
+          // Self update: Can update own profile info (e.g. displayName), but strictly CANNOT change own role!
+          (memberUserId == request.auth.uid && request.resource.data.role == resource.data.role) ||
+          // Non-self update: Role management
+          (
+            request.auth.uid != memberUserId &&
+            isValidRole(request.resource.data.role) &&
+            (
+              isOwner(orgId) ||
+              (isAdmin(orgId) && resource.data.role != 'Owner' && request.resource.data.role != 'Owner')
+            )
+          )
+        );
+
+        // Member deletion / removal:
+        // - Owner can remove anyone (except self if single owner)
+        // - Admin can remove Manager, Member, Viewer (cannot remove Owner)
+        // - Self-removal (leaving org) allowed for non-owners
+        // - Placeholder cleanup allowed for invited user matching email
+        allow delete: if isAuthenticated() && (
+          // Owner removing other members
+          (isOwner(orgId) && memberUserId != request.auth.uid) ||
+          // Admin removing non-owner members
+          (isAdmin(orgId) && resource.data.role != 'Owner' && memberUserId != request.auth.uid) ||
+          // Member voluntarily leaving (must not be an owner)
+          (memberUserId == request.auth.uid && resource.data.role != 'Owner') ||
+          // Placeholder removal when claiming invitation
+          (resource.data.email == request.auth.token.email && resource.data.role != 'Owner')
+        );
+      }
+
+      // =============================================================
+      // Subcollection: Tasks
+      // =============================================================
+      match /tasks/{taskId} {
+        // Read: all verified tenant members (including Viewers)
+        allow read: if isOrgMember(orgId);
+
+        // Create:
+        // - Viewers CANNOT create tasks
+        // - Owner, Admin, Manager can create and assign to anyone
+        // - Member can create, but CANNOT assign to another member (must be self or unassigned)
+        allow create: if isOrgMember(orgId) &&
+          request.resource.data.orgId == orgId &&
+          request.resource.data.creatorId == request.auth.uid &&
+          isValidStatus(request.resource.data.status) &&
+          isValidPriority(request.resource.data.priority) &&
+          (
+            isManagerOrAbove(orgId) ||
+            (isMemberRole(orgId) && (
+              !('assigneeId' in request.resource.data) ||
+              request.resource.data.assigneeId == null ||
+              request.resource.data.assigneeId == request.auth.uid
+            ))
+          );
+
+        // Update:
+        // - Viewers CANNOT update tasks
+        // - Owner, Admin, Manager can update any task
+        // - Member can ONLY update tasks that are assigned to them OR created by them
+        //   And Member CANNOT reassign the task to another member
+        allow update: if isOrgMember(orgId) &&
+          request.resource.data.orgId == orgId &&
+          request.resource.data.creatorId == resource.data.creatorId &&
+          isValidStatus(request.resource.data.status) &&
+          isValidPriority(request.resource.data.priority) &&
+          (
+            isManagerOrAbove(orgId) ||
+            (
+              isMemberRole(orgId) &&
+              (resource.data.assigneeId == request.auth.uid || resource.data.creatorId == request.auth.uid) &&
+              // Member cannot reassign to another user
+              (!('assigneeId' in request.resource.data) || request.resource.data.assigneeId == resource.data.assigneeId)
+            )
+          );
+
+        // Delete:
+        // - Strictly Owner, Admin, Manager. Members and Viewers CANNOT delete tasks.
+        allow delete: if isManagerOrAbove(orgId);
+      }
+
+      // =============================================================
+      // Subcollection: Audit Logs
+      // =============================================================
+      match /audit_logs/{logId} {
+        // Read: restricted to Owner, Admin, Manager. Members and Viewers DENIED.
+        allow read: if isManagerOrAbove(orgId);
+
+        // Create:
+        // Any tenant member or the organization creator during bootstrap, or accepting invitee can append an audit log
+        allow create: if (
+          isOrgMember(orgId) ||
+          (
+            request.resource.data.action in ['org_created', 'invitation_accepted'] &&
+            request.resource.data.organizationId == orgId &&
+            request.resource.data.actorId == request.auth.uid
+          )
+        ) &&
+          request.resource.data.organizationId == orgId &&
+          request.resource.data.actorId == request.auth.uid &&
+          request.resource.data.id == logId;
+
+        // Immutability: Ordinary users must NEVER be able to edit or delete audit logs!
+        allow update: if false;
+        allow delete: if false;
+      }
+
+      // =============================================================
+      // Subcollection: Invitations (Optional helper collection)
+      // =============================================================
+      match /invitations/{invitationId} {
+        allow read: if isOrgMember(orgId);
+        allow create, update, delete: if isAdminOrOwner(orgId);
+      }
+    }
+
+    // ===============================================================
+    // Global Invitations Collection (Top-level for discovery by email)
+    // ===============================================================
+    match /invitations/{invitationId} {
+      // Read: The invited user (by verified token email) or any member of the target organization
+      allow read: if isAuthenticated() && (
+        resource.data.email == request.auth.token.email ||
+        isOrgMember(resource.data.organizationId)
+      );
+
+      // Create: Admin or Owner of the target organization
+      allow create: if isAuthenticated() &&
+        isAdminOrOwner(request.resource.data.organizationId) &&
+        request.resource.data.id == invitationId &&
+        isValidRole(request.resource.data.role) &&
+        (isOwner(request.resource.data.organizationId) || request.resource.data.role != 'Owner');
+
+      // Update: Invited user can accept/decline; Admin or Owner can manage
+      allow update: if isAuthenticated() && (
+        (
+          resource.data.email == request.auth.token.email &&
+          (request.resource.data.status == 'accepted' || request.resource.data.status == 'declined')
+        ) ||
+        isAdminOrOwner(resource.data.organizationId)
+      );
+
+      // Delete: Admin or Owner of the organization
+      allow delete: if isAuthenticated() && isAdminOrOwner(resource.data.organizationId);
+    }
+
+    // ===============================================================
+    // Collection Group: Members (for discovery of memberships by email/UID)
+    // ===============================================================
+    match /{path=**}/members/{memberDocId} {
+      allow read: if isAuthenticated() && (
+        resource.data.email == request.auth.token.email ||
+        resource.data.userId == request.auth.uid ||
+        memberDocId == request.auth.uid
+      );
+    }
+  }
+}
